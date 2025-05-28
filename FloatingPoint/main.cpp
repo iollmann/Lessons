@@ -78,7 +78,7 @@ int TestFunction( UnaryFunction testF, UnaryFunction referenceF)
 }
 
 
-static inline float FloatUlps( float test, double correct )
+static inline double FloatUlps( float test, double correct )
 {
     if( isnan(correct) && isnan(test))
         return 0;
@@ -97,7 +97,7 @@ static inline float FloatUlps( float test, double correct )
     //Modified Goldberg Ulp  https://inria.hal.science/inria-00070503v1/document
     if(fabs(referenceFract) == 0.5)
         fraction *= 2;
-    return (float) ldexp(fraction, ulpExp);
+    return ldexp(fraction, ulpExp);
 }
 
 int TestTranscendental( UnaryFunction testF, ReferenceFunction referenceF)
@@ -106,7 +106,7 @@ int TestTranscendental( UnaryFunction testF, ReferenceFunction referenceF)
     
     __block int result = 0;
     __block volatile float worstCase = NAN;
-    __block volatile float worstError = 0;
+    __block volatile double worstError = 0;
     
     constexpr unsigned long kIterationStride = 1UL << 16;
     dispatch_apply( 100000000ULL / kIterationStride,
@@ -127,7 +127,7 @@ int TestTranscendental( UnaryFunction testF, ReferenceFunction referenceF)
             float test = testF(u.f);
             double reference = referenceF(u.f);
             
-            float error = FloatUlps( test, reference );
+            double error = FloatUlps( test, reference );
             if( fabs(error) > fabs(worstError))
             {
                 worstCase = u.f;
@@ -142,7 +142,7 @@ int TestTranscendental( UnaryFunction testF, ReferenceFunction referenceF)
         }
     });
     
-    printf( "(Worst case: %f ulps @ %a) ", worstError, worstCase);
+    printf( "(Worst case: %10.14f ulps @ %a: *%a vs %a) ", worstError, worstCase, referenceF(worstCase), testF(worstCase));
     return result;
 }
 
@@ -177,8 +177,8 @@ int main(int argc, const char * argv[])
         return error;
     printf( "passed\n");
 
-    printf( "Testing log...");
-    if( (error = TestTranscendental( Log, log)))
+    printf( "Testing log2...");
+    if( (error = TestTranscendental( Log2, log2)))
         return error;
     printf( "passed\n\n\n");
 
