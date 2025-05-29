@@ -222,15 +222,17 @@ int main(int argc, const char * argv[])
 //  For this, you will need:
 //      1) a fast and accurate timer.  Some CPU timers are not on the CPU and take 100,000 instructions to use.
 //          You want the one which is more like 10 instructions or 1 instruction.
-//              e.g. https://developer.apple.com/documentation/kernel/1462446-mach_absolute_time
+//
+//              Some candidates:
+//                   https://developer.apple.com/documentation/kernel/1462446-mach_absolute_time
 //                   https://lemire.me/blog/2021/03/24/counting-cycles-and-instructions-on-the-apple-m1-processor/
 //                   Performance monitor counters usually include a cycle time. If you can figure how how to read
 //                   PMCs, then you will usually get the capability to read cycles.  https://gist.github.com/ibireme/173517c208c7dc333ba962c1f0d67d12
 //
-//      2) Some understanding of preemptive multitasking.  https://developer.apple.com/library/archive/documentation/Carbon/Conceptual/Multitasking_MultiproServ/02concepts/concepts.html
+//      2) Some understanding of preemptive multitasking.
 //
-//          On a unix system, such as macOS (which runs a mach unix kernel under a BSD unix layer), the kernel under typical use
-//          time slices up work among the many tasks clamoring for time on the CPU.  For a list you can use top in the terminal or
+//          On a unix system, such as macOS (which runs a mach unix kernel under a BSD unix layer), under typical use the kernel
+//          time slices up work among the many tasks clamoring for time on the CPU.  For a list, you can use top in the terminal or
 //          ActivityMonitor.app. While an in depth description of how this works would take quite a bit of time, for the purpose
 //          of this lesson, it is sufficient to say that from time to time your threads will be put to sleep by the CPU in order to
 //          do other work in other processes, or perhaps other threads in this process. This of course happens quite commonly when
@@ -240,79 +242,116 @@ int main(int argc, const char * argv[])
 //          are timing a set amount of work to figure out how fast it is and the kernel decides to suspend that work and do something
 //          else for a while this will contaminate your results! Not good for the budding young student of the scientific method.
 //
+//              https://developer.apple.com/library/archive/documentation/Carbon/Conceptual/Multitasking_MultiproServ/02concepts/concepts.html
+//
+//          Note: As a student of computer science, in a top CS department, you might be asked to write a preemptive multitasking scheduler
+//          as part of an entire kernel: https://pdos.csail.mit.edu/6.828/2017/labs/lab4/      It looks like you get 1 week!
+//
 //      3) Test method
 //
-//          To solve this problem we will use statistics. Since many statistics like std deviation are not valid without N=3 (multiple
-//          measurements) we will have to set up a test workload and then run it many times and look at the results to figure out how
-//          best to report an accurate score. This is slightly complicated by a few factors:
+//          To solve the noisy data problem we will use statistics. Since many statistics like std deviation are not valid without
+//          N>=3 (multiple measurements) we will have to set up a test workload and then run it many times and look at the results to
+//          figure out how best to report an accurate score. This is slightly complicated by a few factors:
 //
 //              1) Use the right timing units.
 //
 //                  The actual unit of time on a CPU or GPU is 1 cycle, which is the amount of time that passes between when one
 //                  instruction can finish out of an execution unit (which does the actual computation, e.g. 1+1=2) and when the
-//                  next instruction can finish out of the same execution unit. (Note that this is not quite so simple since the time
-//                  when instructions finish is not directly observable because there is a downstream stage that determines whether
-//                  the results are even needed / valid -- a branch might have mis-predicted -- that will generally act to aggregate
+//                  next instruction can finish out of the same execution unit. (Note that this is not quite so simple because the time
+//                  when instructions finish is not directly observable because there is a downstream completion stage that determines
+//                  whether the results are even needed / valid -- a branch might have mis-predicted. It also makes sure the work observably
+//                  completes in the order it appears in the instruction stream. (This is call an out of order processor, which generally
+//                  seeks to move work that can complete earlier to an earlier point in time so that it is not getting in the way of the
+//                  critical part of the workload that is bottlenecking progress.) This completion stage will generally act to aggregate
 //                  instructions together so that they are observed to complete in a clumpy fashion.) You'll have to just trust me
-//                  that there is a basic quantum of time that regulates instruction flow through a particular execution unit. Each
-//                  processor core may have many execution units, sometimes as many as 10 or 11, though since they do different
-//                  types of tasks, usually not all of them are busy at the same time. In turn, there are usually 8-16 cores, each
-//                  of which may run 1 or 2 threads. However many there are, there is a speed of light. You will get no more than one
-//                  instruction per execution unit per cycle throughput.
+//                  that there is a basic quantum of time that regulates instruction flow through a particular execution unit. More than
+//                  one instruction can finish each cycle. Each processor core may have many execution units, sometimes as many as 10 or 11,
+//                  capable of operating in parallel, though since they do different types of tasks, usually not all of them are typically
+//                  busy at the same time, depending on workload. In addition, there are usually 8-16 cores, each of which may run 1 or 2
+//                  threads. However many execution units operating in parallel there are, there is a speed of light. You will get no more
+//                  than one instruction per execution unit per cycle throughput.
 //
 //                  The question of what timing unit to use -- wall clock time or CPU cycle -- depends on what you are trying to
 //                  measure and how you are trying to understand you results.  The length of time one cycle can take, "the clock frequency",
-//                  can vary. The machine will speed up or slow down the cycle in response to how hot the processor is getting to
-//                  avoid melting.  For this reason, benchmarking can be quite frustratingly error prone if you are trying to understand
-//                  the microscopic float of instructions through the processor using wall clock time. If you measure such things in
-//                  cycles, then they become quite regular and repeatable. You will be in this situation if you have designed a loop
-//                  in your function to have 11 instructions in instruction issue port 0, 12 in port 1, 6 in port 5, and 4 each in ports 2,3
-//                  and 6 and from this infer that the loop should take the longest of these, 12 cycles. If on the other hand, you just
-//                  want your game to run fast, then you should use wall clock time. Different times; not linearly related. Choose the
-//                  right one.  It is not okay to measure the wall clock time and just multiply by the reported clock frequency to get
-//                  cycles. This is almost always wrong. The clock frequency is often changing. Resist the temptation to find ways to
-//                  lock the clock frequency in place. This is engineer thinking and doesn't solve the whole problem. Instead we will
-//                  use error resistant statistical methods.
+//                  can vary.
+//
+//                      A faster clock frequency, meaning that instructions flow through the processor individually faster, will
+//                      mean the transistors have to switch faster. Making a transistor switch faster takes a higher voltage.
+//                      Since Power = Voltage * Amperage;  Amperage = Voltage / Resistance; Therefore:  Power = Voltage^2 / Resistance
+//                      Per physics, all of this power ultimately goes to heat. If we want the clock frequency to go faster, it is
+//                      going to heat up the chip quadratically and run down the battery at a similarly enhanced rate. For this reason,
+//                      the clock frequency will vary tremendously under load and in response to internal temperature. In extreme cases,
+//                      the processor might just shut itself off to avoid melting.
+//
+//                  Because the clock frequency is constantly going up and down, benchmarking can be quite frustratingly error prone if
+//                  you are trying to understand the microscopic flow of instructions through the processor using wall clock time. If
+//                  you measure such things in cycles, then they become quite regular and repeatable because the instructions per second
+//                  is variable but instructions per cycle is fixed. You will want to measure in cycles if your understanding of performance
+//                  is measured in instructions that need to complete before the workload finishes. Let say you have designed a loop in
+//                  your function to have 11 instructions in instruction issue port 0, 12 in port 1, 6 in port 5, and 4 each in ports 2,3
+//                  and 6 and from this infer that the loop should take the longest of these, 12 cycles. Then you are thinking in instructions
+//                  and will want to verify your work by measuring in cycles. If on the other hand, you just want your game to run fast,
+//                  then you should use wall clock time. Different times; not linearly related. Choose the right one.
+//
+//                      It is not okay to measure the wall clock time and just multiply by the reported clock frequency to get cycles.
+//                      This is almost always wrong. The clock frequency is often changing. Resist the temptation to find ways to lock
+//                      the clock frequency in place. This is engineer thinking and isn't guaranteed solve the whole problem, in the
+//                      face of a machine that nobody completely understands, even its designers. Instead, we will use error resistant
+//                      statistical methods that will work even if things are not quite as we expect. This is the difference between
+//                      scientists and engineers. Engineers think they know everything until they find out they don't -- if they are
+//                      lucky. Scientists start with the presumption of ignorance and prove each fact as they go along.  Engineers do
+//                      not develop good experimental skills.  They are better at reading specs, though.
 //
 //                  Once you have decided whether you want cycles or seconds, choose the appropriate low latency timer that gives you
-//                  that.  Note that cycle timers can involve quite arcane incantations to get to and some digging. You may have to resort
-//                  to assembly language or calling obscure kernel APIs.
+//                  that.
+//
+//                  Note that cycle timers can involve quite arcane incantations to get to and some digging. You may have to resort
+//                  to assembly language or calling obscure kernel APIs. Cycle counts and even instruction sets are often not reported
+//                  so as to make it harder for competitors to understand how your product does what it does. While this might benefit
+//                  the inexplicably spoiled shareholder, it is a problem for engineers in general. For this reason, even if they did
+//                  not intend to become scientists and their training certainly doesn't help them succeed, in their race to cause
+//                  problems for themselves in dubious service to the shareholder, engineers often /need/ to be scientists.
 //
 //              2) Use the right statistical measure
 //
 //                  Here again the right statistical measure varies according to what you want to know. In the above example of a carefully
-//                  architected loop that finishes in 12  cycles, it is probably sufficient to measure the run time (using a cycle counter)
+//                  architected loop that finishes in 12 cycles, it is probably sufficient to measure the run time (using a cycle counter)
 //                  a bunch of times and take the minimum time.  While most engineers will tell you this is unrepresentative because sometimes
 //                  it takes longer or a lot longer than that and you will miss that information, the is an unsophisticated view of data
 //                  use.  What we would be trying to confirm in this situation is whether our initial calculation that the loop should actually
 //                  be 12 cycles in a perfect world is correct. If instead we measure it to be 15 cycles, then we have probably made a mistake
 //                  either in measurement or our machine understanding.  It is important to understand and fix this mistake.  Adding in
-//                  the contaminating times as the unsophisticated mere engineer would have us do would only muddy this picture and make it
-//                  harder to tell when we had succeeded in eliminating the error. Since we want to know what the speed of light is for this
-//                  function, we measure the minimum time as a direct measure of speed of light performance. Generally speaking, if you are
-//                  using cycle times, then you probably are also looking at minimum times, since cycle times generally mean we are asking
-//                  experimentally questions above machine architecture, and the machine we may surmise should be fairly fixed and reproducible
-//                  in its behavior. We are just using cycle counters and minimum times to filter out interference from clock slewing and
+//                  the contaminating times arising from preemption or perhaps cache misses as the unsophisticated mere engineer would have
+//                  us do would only muddy this picture and make it harder to tell when we had succeeded in eliminating the error and may
+//                  prevent us from proving our timing hypothesis correct, thereby preventing us from moving forward from a solid point of
+//                  understanding. Since the scientists would want to know what the speed of light is for this function, we measure the
+//                  minimum time as a direct measure of speed of light performance. (One lesson in science is to always prefer direct measures
+//                  to indirect measures.) Generally speaking, if you are using cycle times, then you probably are also looking at minimum
+//                  times, since cycle times generally mean we are asking experimentally questions above machine architecture, and the
+//                  machine we may surmise should be fairly fixed and reproducible in its behavior. It can't run faster than its architecture, so
+//                  a minimum time is good enough. Cycle counters and minimum times to filter out interference from clock slewing and
 //                  preemptive multitasking respectively.
 //
 //                  If you are looking at just making code run fast (without taking time to infer the microarchitecture of the machine)
 //                  -- this may even be necessary in the 12 cycle loop example if the code runs much slower than than expected because the
-//                  data does not fit in the L1 cache, meaning the CPU core is not the bottleneck -- then we are probably looking at using some
-//                  sort of average time.  There remains a problem with this though in that if we run the same experiment a bunch of times,
-//                  we may find we get 10 times all around 30 microseconds and one at half a second. This half second run will totally
-//                  perturb the results such that our mean time is off by more than a factor of two and if we repeat the whole series of runs
-//                  again wont be the same.  It is very hard to optimize code when the benchmark loop jumps up and down by a factor of two
-//                  randomly!  You will never know if your change actually improved things or not.  So we have to fix this somehow. A repeatable
-//                  measure should be repeatable. That is if we run the benchmark app again once a day for a week, we should get substantially
-//                  similar results each time.
+//                  data does not fit in the L1 cache, meaning the CPU core is not the bottleneck, and we have no model for cache operation --
+//                  then we are probably looking at using some sort of average wall clock time.  There remains a problem with this though
+//                  in that if we run the same experiment a bunch of times, we may find we get 10 times all around 30 microseconds and one
+//                  at half a second. While a human will quickly see the discrepancy and ignore the 0.5s time, it will totally perturb the
+//                  results from a simple dumb average such that our mean time is off by more than a factor of two! Worse for supporting a
+//                  useful hypothesis (e.g. the code change I made make it faster / not faster), if we repeat the whole series of runs again
+//                  wont be the same.  It is very hard to optimize code when the benchmark loop jumps up and down by a factor of two randomly!
+//                  You will never know if your change actually improved things or not.  So we have to fix this somehow. A repeatable measure
+//                  should be repeatable. That is if we run the benchmark app again once a day for a week, we should get substantially similar
+//                  results each time. What to do?
 //
 //                  There are a couple of methods to do this. A statistician might point to something like a P-test to throw away the occasional
-//                  squirrelly value. You can use this. I didn't go that way. Another method might be to simply decide how accurate your
+//                  squirrelly value. You can use this, but what if there are two of them? Another method might be to simply decide how accurate your
 //                  results need to be and then run the experiment until such time that your estimate of the error in the mean is small
 //                  enough that you have the accuracy you need.  That is, iterate until the Standard Deviation of the Mean (which is not
 //                  the same thing as a the Standard Deviation) is small enough.
 //
-//                      Standard deviation and standard deviation of the mean have different formulas. If you iterate taking measurements
+//                  Standard deviation and standard deviation of the mean have different formulas. If you iterate taking measurements
 //                  forever, the standard deviation will not go down, but the standard deviation of the mean will. The standard deviation of
 //                  the mean is also known as the standard error of the mean. It is a measure of how close the estimated mean is to the true mean,
 //                  -- that is, the accuracy of the mean -- whereas the standard deviation is just how much noise is in the data relative to the mean.
@@ -324,36 +363,37 @@ int main(int argc, const char * argv[])
 //
 //                  The operating system has habits. It will tend to interrupt you ever so often. If you design your single measurement
 //                  to run much longer than that, then your likelihood of being preempted is quite high and all of your measurements are
-//                  likely to be off. It may take a long time to converge. If you measure too short a time, then clock latency is a problem.
-//                  (This is the amount of time it takes to actually read the time from the clock.)  If you measure a work unit large enough
-//                  that clock latency is comparatively tiny and it is still relatively unlikely to be preempted, then you have it about right.
+//                  likely to be off. The error in your mean may take a long time to converge towards the desired confidence limit. If you
+//                  measure too short a time, then clock latency is a problem. (This is the amount of time it takes to actually read the
+//                  time from the clock.)  If you measure a work unit large enough that clock latency is comparatively tiny and it is
+//                  still relatively unlikely to be preempted, then you have it about right.
 //
 //              4)  Putting it all together:
 //
-//                  If you want a quality benchmark, the kind an experimental scientist would design, rather than a engineer would just
-//                  throw together then we will need to run some experiments to run the experiment.  This should be no surprise to any
-//                  experimentalist. Any measurement protocol needs to be debugged for sources of error and redesigned to eliminate them
-//                  as much as possible. Only then is the experiment useful.
+//                  If you want a quality benchmark, the kind an experimental scientist would design rather than a engineer would just
+//                  throw together, then we will need to run some experiments to run the experiment. Don't worry, this part can still be
+//                  automated. The fact that we need to do this should be no surprise to any experimentalist. Any measurement protocol
+//                  needs to be debugged for sources of error and redesigned to eliminate them as much as possible. Only then is the
+//                  experiment useful at returning accurate numbers instead of random numbers. If you are going to stake your professional
+//                  reputation on being able to monitor performance regressions in your code or even optimize your code, some attention
+//                  to this matter is due.
 //
 //                  a) measure system behavior
 //
-//                      Put together a sample toy benchmark loop that just hammers on the timer. See how long you can do that before an
-//                      exceptionally long delay occurs. (We presume this run was preempted by the kernel.)  See what the largest typical
-//                      time period we can run while still being relatively sure we probably wont be preempted. I measured this when
-//                      I started at Apple to be around 50 µs in 2001, but haven't repeated the experiment. It is probably time.
+//                      Measure how often the system is likely to preempt your benchmark loop. Is there a fairly safe amount of time
+//                      wherein one is likely to be preempted a maximum of once and most of the time, not at all?
 //
 //                  b) measure the clock latency.
 //
-//                      Put together a loop that just times how quickly the loop can iterate. (This might be the same loop from a) If all
-//                      the loop does is call the clock each time it goes around, then the typical time from loop iteration to loop iteration
-//                      is the clock latency. We will subtract this from all future times.  (Note: if you are measuring minimum times, you'll
-//                      want to use the minimum clock latency. If you are measuring average times, then you'll want some average unpreempted
-//                      clock latency.) We will subtract this from all future measurements.
+//                      Measure how long it takes for the clock to measure time. This is systematic error in our practice.  We will want
+//                      to subtract this time from all future measurements.
 //
-//                  b) measure the rough amount of time it takes to do a minimum benchmark iteration. This might be one call to floor()
-//                          Figure how how many times to loop on floor before we start to fill up our 10% of our preemption window.
-//                          This is probably a good amount of time to measure. If we can call floor 1000 times during this time, then
-//                          We will write our benchmark loop like this:
+//                  b) Tailor your benchmark load to fit well with the benchmarking time window the system allows before preemption is
+//                      likely.  What we are trying to do here is make the timing loop robust against a wide variety of code samples,
+//                      from a tiny function like floor (a single instruction on some architectures!) out to a whole 1000x1000 matrix
+//                      multiply.  For best accuracy, we want the benchmark load to be much larger than the clock latency, but still smaller
+//                      than the preemption window such that it is unusual that preemption happens between when we measure start and
+//                      stop times. We will adjust the workload to fit. Example:
 //
 //                          for( i = 0; i < testCount; i++ )
 //                          {
@@ -382,8 +422,8 @@ int main(int argc, const char * argv[])
 //                      https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance.  Note that the arguments here about
 //                      numerical instability stem from a naive understanding of floating-point. We can actually do this without
 //                      much trouble if we are just a little bit careful to understand when rounding is okay and when it is not
-//                      and avoid it when it is not okay.  When we don't want rounding, we will just use large integers like
-//                      __uint128_t.
+//                      and avoid it when it is not okay.  When we don't want rounding, we will just use large integers instead.
+//                      How big do the integers have to be?
 //
 //                  d)  Draft reusable benchmark code you can use in other contexts.  Can we code this up as a functor:
 //
@@ -391,26 +431,31 @@ int main(int argc, const char * argv[])
 //                              inline double operator(){ /* thing to be timed here */ };          // Called as:  SampleFunctor()
 //                          };
 //
+//                          /*! @abstract Benchmark information we collected when BenchmarkFunctor was running */
 //                          typedef struct Benchmark
 //                          {
 //                              double meanTime;                // mean time used for Functor()
-//                              double stdErrorOfTheMean;       //
-//                              double minimumTime;
-//                              double N;
+//                              double stdDeviation;            // standard deviation
+//                              double stdErrorOfTheMean;       // standard error of the mean.  THIS IS NOT THE STANDARD DEVIATION!
+//                              double minimumTime;             // The minimum time the functor took to run
+//                              double N;                       // The number of test measurements we made.  THis should probably be at least 10.
 //                              ...
 //                          }Benchmark;
 //
 //                          /*! @abstract Measure the time taken by Functor.operator().
-//                           *  @param precisionRequired How accurate the stdErrorOfTheMean needs to be, e.g. 0.01 for ±1% */
-//                          template <typename Functor> Benchmark BenchmarkFunctor( const Functor & f, double precisionRequired );
+//                           *  @param  f                   A functor in the style of sampleFunctor that contains the desired workload
+//                           *  @param precisionRequired    How accurate the stdErrorOfTheMean needs to be, e.g. 0.01 for ±1% */
+//                          template <typename Functor> Benchmark BenchmarkFunctor( const Functor & f,
+//                                                                                  double precisionRequired );
 //
-//                      which will automate this whole process?
-//
-//                      Please examine the output assembly to ensure that the timed routine wasn't optimized away. Take steps
+//                      Please examine the output assembly to ensure that the Functor() wasn't optimized away. Take steps
 //                      to ensure it is not.
 //
 //                  e)  Become Famous!
 //
 //                      Write this up with supporting data and publish it on github
-//                      make it work on windows too?
+//                      Make it work on windows too?
+//
+//              5) The distribution of times are not normally distributed.  Is it log-normal? Is it something else?
+//                  How might this methodology be improved?
 //
